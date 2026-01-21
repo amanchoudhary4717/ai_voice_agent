@@ -18,6 +18,24 @@ import asyncio
 
 load_dotenv()
 
+firecrawl = FirecrawlApp(
+    api_key=st.secrets["fc-7bc075325c1f41ee954ae266a140a1ed"]
+)
+result = firecrawl.crawl(
+    url=doc_url,
+    params={
+        "limit": 20,
+        "scrapeOptions": {
+            "formats": ["markdown"]
+        }
+    }
+)
+documents = result["data"]
+
+for doc in documents:
+    text = doc["markdown"]
+
+
 def init_session_state():
     defaults = {
         "initialized": False,
