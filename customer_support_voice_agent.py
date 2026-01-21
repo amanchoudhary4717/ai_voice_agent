@@ -152,7 +152,7 @@ def crawl_documentation(firecrawl_api_key: str, url: str, output_dir: Optional[s
     firecrawl = FirecrawlApp(api_key=firecrawl_api_key)
     pages = []
 
-    result = firecrawl.crawl(
+    job = firecrawl.crawl(
         url=url,
         limit=5,
         scrape_options={
@@ -160,12 +160,12 @@ def crawl_documentation(firecrawl_api_key: str, url: str, output_dir: Optional[s
         }
     )
 
-    for page in result.get("data", []):
-        content = page.get("markdown", "")
-        metadata = page.get("metadata", {})
+    for page in job.data:
+        content = page.markdown or ""
+        metadata = page.metadata or {}
         source_url = metadata.get("sourceURL", url)
 
-        if not content:
+        if not content or len(content) < 200:
             continue
 
         pages.append({
@@ -180,6 +180,7 @@ def crawl_documentation(firecrawl_api_key: str, url: str, output_dir: Optional[s
         })
 
     return pages
+
 
 
 
