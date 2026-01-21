@@ -1,7 +1,9 @@
-streamlit
+streamlit>=1.30.0
 firecrawl-py
 qdrant-client
-fastembed
-openai
+openai>=1.0.0
 sentence-transformers
-langchain-text-splitters
+langchain-text-splitters>=0.2.0
+openai-agents
+numpy
+torch
