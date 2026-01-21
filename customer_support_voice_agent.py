@@ -23,7 +23,7 @@ COLLECTION_NAME = "docs_embeddings"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 MAX_CONTEXT_CHARS = 6000
-QUERY_COOLDOWN_SECONDS = 5
+QUERY_COOLDOWN_SECONDS = 15
 
 
 # ===============================
@@ -45,8 +45,9 @@ async def retry_openai(call, retries=3, base_delay=2):
             return await call()
         except RateLimitError:
             if attempt == retries - 1:
-                raise
+                return None
             await asyncio.sleep(base_delay * (attempt + 1))
+
 
 
 # ===============================
@@ -209,7 +210,7 @@ async def process_query(question: str):
     results = client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector.tolist(),
-        limit=5,
+        limit=3,
         with_payload=True,
     ).points
 
@@ -235,11 +236,21 @@ Question:
 {question}
 """
 
-    processor_result = await retry_openai(
-        lambda: Runner.run(st.session_state.processor_agent, prompt)
-    )
+processor_result = await retry_openai(
+    lambda: Runner.run(st.session_state.processor_agent, prompt)
+)
 
-    answer = processor_result.final_output
+if processor_result is None:
+    return (
+        "⚠️ The AI is temporarily busy due to rate limits. "
+        "Please wait a minute and try again.",
+        None
+    )
+if not answer:
+    return answer, None
+
+answer = processor_result.final_output
+
 
     async_openai = AsyncOpenAI()
     audio = await retry_openai(
