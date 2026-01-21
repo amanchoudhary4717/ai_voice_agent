@@ -1,8 +1,9 @@
-from typing import List, Dict, Optional
+from typing import List, Dict
 import os
 import uuid
 import tempfile
 import asyncio
+import time
 from datetime import datetime
 
 import streamlit as st
@@ -12,57 +13,63 @@ from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams
 from fastembed import TextEmbedding
 from agents import Agent, Runner
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 
 
-# -------------------------------
+# ===============================
 # CONFIG
-# -------------------------------
+# ===============================
 COLLECTION_NAME = "docs_embeddings"
-MAX_CONTEXT_CHARS = 6000
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
+MAX_CONTEXT_CHARS = 6000
+QUERY_COOLDOWN_SECONDS = 5
 
 
-# -------------------------------
-# UTILS
-# -------------------------------
-def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+# ===============================
+# HELPERS
+# ===============================
+def chunk_text(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     chunks = []
     start = 0
-    length = len(text)
-
-    while start < length:
-        end = start + chunk_size
+    while start < len(text):
+        end = start + size
         chunks.append(text[start:end])
         start = end - overlap
-
     return chunks
 
 
-# -------------------------------
+async def retry_openai(call, retries=3, base_delay=2):
+    for attempt in range(retries):
+        try:
+            return await call()
+        except RateLimitError:
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(base_delay * (attempt + 1))
+
+
+# ===============================
 # SESSION STATE
-# -------------------------------
+# ===============================
 def init_session_state():
     defaults = {
-        "initialized": False,
         "setup_complete": False,
         "client": None,
         "embedding_model": None,
         "processor_agent": None,
-        "tts_agent": None,
         "selected_voice": "coral",
+        "last_query_time": 0.0,
     }
-
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
-# -------------------------------
+# ===============================
 # SIDEBAR
-# -------------------------------
-def sidebar_config():
+# ===============================
+def sidebar():
     with st.sidebar:
         st.title("🔑 Configuration")
 
@@ -78,34 +85,30 @@ def sidebar_config():
 
         if st.button("Initialize System", type="primary"):
             if not all([qdrant_url, qdrant_api_key, firecrawl_api_key, openai_api_key, doc_url]):
-                st.error("Fill all fields")
+                st.error("Please fill all fields.")
                 return
 
-            with st.status("Initializing...", expanded=True):
+            with st.status("Initializing system...", expanded=True):
                 client, embedding_model = setup_qdrant(qdrant_url, qdrant_api_key)
                 pages = crawl_docs(firecrawl_api_key, doc_url)
                 store_embeddings(client, embedding_model, pages)
-
-                processor_agent, tts_agent = setup_agents(openai_api_key)
+                processor_agent = setup_agent(openai_api_key)
 
                 st.session_state.client = client
                 st.session_state.embedding_model = embedding_model
                 st.session_state.processor_agent = processor_agent
-                st.session_state.tts_agent = tts_agent
                 st.session_state.setup_complete = True
 
-            st.success("System ready")
+            st.success("System initialized successfully.")
 
 
-# -------------------------------
+# ===============================
 # QDRANT
-# -------------------------------
+# ===============================
 def setup_qdrant(url: str, api_key: str):
     client = QdrantClient(url=url, api_key=api_key)
     embedding_model = TextEmbedding()
-
-    test_vector = list(embedding_model.embed(["test"]))[0]
-    dim = len(test_vector)
+    dim = len(list(embedding_model.embed(["test"]))[0])
 
     try:
         client.create_collection(
@@ -118,10 +121,10 @@ def setup_qdrant(url: str, api_key: str):
     return client, embedding_model
 
 
-# -------------------------------
+# ===============================
 # FIRECRAWL
-# -------------------------------
-def crawl_docs(api_key: str, url: str):
+# ===============================
+def crawl_docs(api_key: str, url: str) -> List[Dict]:
     firecrawl = FirecrawlApp(api_key=api_key)
     pages = []
 
@@ -140,21 +143,19 @@ def crawl_docs(api_key: str, url: str):
             "url": getattr(page.metadata, "sourceURL", url),
             "metadata": {
                 "title": getattr(page.metadata, "title", ""),
-                "crawl_date": datetime.now().isoformat()
-            }
+                "crawl_date": datetime.now().isoformat(),
+            },
         })
 
     return pages
 
 
-# -------------------------------
-# STORE EMBEDDINGS (FIXED)
-# -------------------------------
+# ===============================
+# EMBEDDINGS (FIXED)
+# ===============================
 def store_embeddings(client, embedding_model, pages):
     for page in pages:
-        chunks = chunk_text(page["content"])
-
-        for chunk in chunks:
+        for chunk in chunk_text(page["content"]):
             vector = list(embedding_model.embed([chunk]))[0]
 
             client.upsert(
@@ -166,45 +167,44 @@ def store_embeddings(client, embedding_model, pages):
                         payload={
                             "content": chunk,
                             "url": page["url"],
-                            **page["metadata"]
+                            **page["metadata"],
                         },
                     )
                 ],
             )
 
 
-# -------------------------------
-# AGENTS
-# -------------------------------
-def setup_agents(openai_api_key: str):
+# ===============================
+# AGENT
+# ===============================
+def setup_agent(openai_api_key: str):
     os.environ["OPENAI_API_KEY"] = openai_api_key
 
-    processor = Agent(
-        name="Doc Assistant",
+    return Agent(
+        name="Documentation Assistant",
         instructions=(
-            "Answer using only the provided documentation context. "
-            "Be concise and clear. Cite sources."
+            "Answer the user's question using ONLY the provided documentation context. "
+            "Be concise, clear, and accurate. Cite sources when relevant."
         ),
         model="gpt-4o-mini",
     )
 
-    tts = Agent(
-        name="TTS",
-        instructions="Convert the answer into natural speech.",
-        model="gpt-4o-mini-tts",
-    )
 
-    return processor, tts
+# ===============================
+# QUERY PIPELINE
+# ===============================
+async def process_query(question: str):
+    # cooldown
+    if time.time() - st.session_state.last_query_time < QUERY_COOLDOWN_SECONDS:
+        st.warning("Please wait a few seconds before asking again.")
+        return None, None
 
+    st.session_state.last_query_time = time.time()
 
-# -------------------------------
-# QUERY PIPELINE (FIXED)
-# -------------------------------
-async def process_query(query: str):
     client = st.session_state.client
     embedding_model = st.session_state.embedding_model
 
-    query_vector = list(embedding_model.embed([query]))[0]
+    query_vector = list(embedding_model.embed([question]))[0]
 
     results = client.query_points(
         collection_name=COLLECTION_NAME,
@@ -226,24 +226,29 @@ async def process_query(query: str):
     context = "\n\n".join(context_blocks)
 
     prompt = f"""
-Use the context below to answer the question.
+Use the documentation below to answer the question.
 
-Context:
+Documentation:
 {context}
 
 Question:
-{query}
+{question}
 """
 
-    processor_result = await Runner.run(st.session_state.processor_agent, prompt)
+    processor_result = await retry_openai(
+        lambda: Runner.run(st.session_state.processor_agent, prompt)
+    )
+
     answer = processor_result.final_output
 
     async_openai = AsyncOpenAI()
-    audio = await async_openai.audio.speech.create(
-        model="gpt-4o-mini-tts",
-        voice=st.session_state.selected_voice,
-        input=answer,
-        response_format="mp3",
+    audio = await retry_openai(
+        lambda: async_openai.audio.speech.create(
+            model="gpt-4o-mini-tts",
+            voice=st.session_state.selected_voice,
+            input=answer,
+            response_format="mp3",
+        )
     )
 
     audio_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.mp3")
@@ -253,18 +258,18 @@ Question:
     return answer, audio_path
 
 
-# -------------------------------
+# ===============================
 # UI
-# -------------------------------
+# ===============================
 def run_app():
-    st.set_page_config(page_title="AI Voice Agent", layout="wide")
+    st.set_page_config(page_title="AI Documentation Voice Agent", layout="wide")
     init_session_state()
-    sidebar_config()
+    sidebar()
 
     st.title("🎙️ AI Documentation Voice Agent")
 
     if not st.session_state.setup_complete:
-        st.info("Configure the system in the sidebar")
+        st.info("Configure the system using the sidebar.")
         return
 
     question = st.text_input("Ask a question about the documentation")
@@ -273,11 +278,12 @@ def run_app():
         with st.spinner("Thinking..."):
             answer, audio_path = asyncio.run(process_query(question))
 
-        st.markdown("### Answer")
-        st.write(answer)
+        if answer:
+            st.markdown("### Answer")
+            st.write(answer)
 
-        st.markdown("### 🔊 Audio")
-        st.audio(audio_path)
+            st.markdown("### 🔊 Audio")
+            st.audio(audio_path)
 
 
 if __name__ == "__main__":
