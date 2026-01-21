@@ -1,7 +1,7 @@
-firecrawl
-qdrant-client
 streamlit
+firecrawl-py
+qdrant-client
 fastembed
-openai>=1.0.0
-python-dotenv
-openai-agents
+openai
+sentence-transformers
+langchain-text-splitters
