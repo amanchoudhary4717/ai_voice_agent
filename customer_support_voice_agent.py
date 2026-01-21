@@ -23,7 +23,7 @@ COLLECTION_NAME = "docs_embeddings"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 MAX_CONTEXT_CHARS = 5000
-QUERY_COOLDOWN_SECONDS = 10
+QUERY_COOLDOWN_SECONDS = 15
 
 
 # ===============================
@@ -60,7 +60,6 @@ def init_session_state():
         "processor_agent": None,
         "selected_voice": "coral",
         "last_query_time": 0.0,
-        "demo_mode": True,   # 🔴 DEMO MODE DEFAULT ON
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -68,17 +67,11 @@ def init_session_state():
 
 
 # ===============================
-# SIDEBAR
+# SIDEBAR (MOBILE SAFE)
 # ===============================
 def sidebar():
     with st.sidebar:
-        st.header("⚙️ Configuration")
-
-        # 🔴 DEMO MODE TOGGLE
-        st.toggle("🧪 Demo Mode (no OpenAI calls)", key="demo_mode")
-
-        if st.session_state.demo_mode:
-            st.info("Demo mode is ON. No external API calls.")
+        st.header("⚙️ Setup")
 
         qdrant_url = st.text_input("Qdrant URL", type="password")
         qdrant_api_key = st.text_input("Qdrant API Key", type="password")
@@ -87,28 +80,26 @@ def sidebar():
         doc_url = st.text_input("Documentation URL")
 
         st.markdown("### 🎤 Voice")
-        voices = ["alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova"]
-        st.session_state.selected_voice = st.selectbox(
-            "Voice", voices, index=voices.index("coral")
-        )
+        voices = [
+            "alloy", "ash", "ballad", "coral", "echo",
+            "fable", "onyx", "nova", "sage", "shimmer", "verse"
+        ]
+        st.session_state.selected_voice = st.selectbox("Voice", voices, index=voices.index("coral"))
 
         if st.button("🚀 Initialize System", use_container_width=True):
-            if not doc_url:
-                st.error("Documentation URL required")
+            if not all([qdrant_url, qdrant_api_key, firecrawl_api_key, openai_api_key, doc_url]):
+                st.error("Fill all fields")
                 return
 
             with st.status("Initializing...", expanded=True):
-                # 🔴 DEMO MODE: skip heavy setup
-                if not st.session_state.demo_mode:
-                    client, embedding_model = setup_qdrant(qdrant_url, qdrant_api_key)
-                    pages = crawl_docs(firecrawl_api_key, doc_url)
-                    store_embeddings(client, embedding_model, pages)
-                    processor_agent = setup_agent(openai_api_key)
+                client, embedding_model = setup_qdrant(qdrant_url, qdrant_api_key)
+                pages = crawl_docs(firecrawl_api_key, doc_url)
+                store_embeddings(client, embedding_model, pages)
+                processor_agent = setup_agent(openai_api_key)
 
-                    st.session_state.client = client
-                    st.session_state.embedding_model = embedding_model
-                    st.session_state.processor_agent = processor_agent
-
+                st.session_state.client = client
+                st.session_state.embedding_model = embedding_model
+                st.session_state.processor_agent = processor_agent
                 st.session_state.setup_complete = True
 
             st.success("System ready")
@@ -146,26 +137,28 @@ def crawl_docs(api_key: str, url: str) -> List[Dict]:
 
     job = firecrawl.crawl(
         url=url,
-        limit=3,
+        limit=5,
         scrape_options={"formats": ["markdown"]},
     )
 
     for page in job.data:
-        if page.markdown:
-            pages.append({
-                "content": page.markdown,
-                "url": getattr(page.metadata, "sourceURL", url),
-                "metadata": {
-                    "title": getattr(page.metadata, "title", ""),
-                    "crawl_date": datetime.now().isoformat(),
-                },
-            })
+        if not page.markdown or len(page.markdown) < 200:
+            continue
+
+        pages.append({
+            "content": page.markdown,
+            "url": getattr(page.metadata, "sourceURL", url),
+            "metadata": {
+                "title": getattr(page.metadata, "title", ""),
+                "crawl_date": datetime.now().isoformat(),
+            },
+        })
 
     return pages
 
 
 # ===============================
-# STORE EMBEDDINGS
+# EMBEDDINGS
 # ===============================
 def store_embeddings(client, embedding_model, pages):
     for page in pages:
@@ -203,22 +196,23 @@ def setup_agent(openai_api_key: str):
 
 
 # ===============================
-# QUERY PIPELINE (DEMO SAFE)
+# VOICE → TEXT
+# ===============================
+async def transcribe_audio(audio_bytes):
+    async_openai = AsyncOpenAI()
+    transcript = await retry_openai(
+        lambda: async_openai.audio.transcriptions.create(
+            file=audio_bytes,
+            model="gpt-4o-transcribe"
+        )
+    )
+    return transcript.text if transcript else None
+
+
+# ===============================
+# QUERY PIPELINE
 # ===============================
 async def process_query(question: str):
-    # 🔴 DEMO MODE RESPONSE
-    if st.session_state.demo_mode:
-        return (
-            f"📘 Demo Response:\n\n"
-            f"This app can answer questions like:\n"
-            f"• {question}\n\n"
-            f"In live mode, the AI retrieves relevant documentation chunks, "
-            f"grounds the answer using vector search, and responds with citations.",
-            None,
-            ["Demo Source"]
-        )
-
-    # ---- LIVE MODE BELOW ----
     if time.time() - st.session_state.last_query_time < QUERY_COOLDOWN_SECONDS:
         return "⏳ Please wait a few seconds.", None, []
 
@@ -236,19 +230,37 @@ async def process_query(question: str):
         with_payload=True,
     ).points
 
-    context, sources = [], set()
-    for r in results:
-        context.append(r.payload.get("content", ""))
-        sources.add(r.payload.get("url", "unknown"))
+    if not results:
+        return "No relevant documentation found.", None, []
 
-    prompt = f"Answer using documentation:\n{''.join(context)}\n\nQuestion:{question}"
+    context_blocks, sources = [], set()
+    total_len = 0
+
+    for r in results:
+        text = r.payload.get("content", "")
+        url = r.payload.get("url", "unknown")
+        if total_len + len(text) > MAX_CONTEXT_CHARS:
+            break
+        context_blocks.append(text)
+        sources.add(url)
+        total_len += len(text)
+
+    prompt = f"""
+Answer using the documentation below.
+
+Documentation:
+{chr(10).join(context_blocks)}
+
+Question:
+{question}
+"""
 
     result = await retry_openai(
         lambda: Runner.run(st.session_state.processor_agent, prompt)
     )
 
     if result is None:
-        return "⚠️ AI busy. Try later.", None, list(sources)
+        return "⚠️ AI busy. Try again later.", None, list(sources)
 
     answer = result.final_output
 
@@ -272,28 +284,46 @@ async def process_query(question: str):
 
 
 # ===============================
-# UI (MOBILE FRIENDLY)
+# UI (MOBILE FIRST)
 # ===============================
 def run_app():
-    st.set_page_config(page_title="AI Voice Assistant", layout="centered")
+    st.set_page_config(
+        page_title="AI Voice Support Agent",
+        layout="centered"
+    )
+
     init_session_state()
     sidebar()
 
-    st.title("🎙️ AI Documentation Voice Assistant")
-    st.caption("Demo-ready AI system for documentation and resumes")
+    st.title("🎙️ AI Documentation Voice Agent")
+    st.caption("Ask documentation questions by text or voice")
 
     if not st.session_state.setup_complete:
-        st.info("👈 Initialize the system from the sidebar")
+        st.info("👈 Open the sidebar and initialize the system")
         return
 
+    # Voice input (mobile friendly)
+    audio_input = st.audio_input("🎤 Ask by voice")
+
+    voice_question = None
+    if audio_input:
+        with st.spinner("Transcribing voice..."):
+            voice_question = asyncio.run(transcribe_audio(audio_input))
+        if voice_question:
+            st.success(f"You said: {voice_question}")
+
     question = st.text_input(
-        "Ask a question",
-        placeholder="What projects are listed in my resume?"
+        "💬 Ask by text",
+        placeholder="How do I deploy a Streamlit app?"
     )
 
-    if question:
-        with st.spinner("Processing..."):
-            answer, audio_path, sources = asyncio.run(process_query(question))
+    final_question = voice_question or question
+
+    if final_question:
+        with st.spinner("Thinking..."):
+            answer, audio_path, sources = asyncio.run(
+                process_query(final_question)
+            )
 
         st.subheader("Answer")
         st.write(answer)
@@ -303,8 +333,8 @@ def run_app():
 
         if sources:
             st.subheader("Sources")
-            for s in sources:
-                st.write(s)
+            for src in sources:
+                st.write(src)
 
 
 if __name__ == "__main__":
