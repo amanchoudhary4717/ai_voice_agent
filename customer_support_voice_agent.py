@@ -162,24 +162,25 @@ def crawl_documentation(firecrawl_api_key: str, url: str, output_dir: Optional[s
 
     for page in job.data:
         content = page.markdown or ""
-        metadata = page.metadata or {}
-        source_url = metadata.get("sourceURL", url)
-
         if not content or len(content) < 200:
             continue
+
+        metadata = page.metadata
+        source_url = getattr(metadata, "sourceURL", url)
 
         pages.append({
             "content": content,
             "url": source_url,
             "metadata": {
-                "title": metadata.get("title", ""),
-                "description": metadata.get("description", ""),
-                "language": metadata.get("language", "en"),
+                "title": getattr(metadata, "title", ""),
+                "description": getattr(metadata, "description", ""),
+                "language": getattr(metadata, "language", "en"),
                 "crawl_date": datetime.now().isoformat()
             }
         })
 
     return pages
+
 
 
 
