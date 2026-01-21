@@ -18,22 +18,6 @@ import asyncio
 
 load_dotenv()
 
-firecrawl = FirecrawlApp(
-    api_key=st.secrets["fc-7bc075325c1f41ee954ae266a140a1ed"]
-)
-result = firecrawl.crawl(
-    url=doc_url,
-    params={
-        "limit": 20,
-        "scrapeOptions": {
-            "formats": ["markdown"]
-        }
-    }
-)
-documents = result["data"]
-
-for doc in documents:
-    text = doc["markdown"]
 
 
 def init_session_state():
@@ -167,51 +151,38 @@ def setup_qdrant_collection(qdrant_url: str, qdrant_api_key: str, collection_nam
 def crawl_documentation(firecrawl_api_key: str, url: str, output_dir: Optional[str] = None):
     firecrawl = FirecrawlApp(api_key=firecrawl_api_key)
     pages = []
-    
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    
-    response = firecrawl.crawl_url(
-        url,
+
+    result = firecrawl.crawl(
+        url=url,
         params={
-            'limit': 5,
-            'scrapeOptions': {
-                'formats': ['markdown', 'html']
+            "limit": 5,
+            "scrapeOptions": {
+                "formats": ["markdown"]
             }
         }
     )
-    
-    while True:
-        for page in response.get('data', []):
-            content = page.get('markdown') or page.get('html', '')
-            metadata = page.get('metadata', {})
-            source_url = metadata.get('sourceURL', '')
-            
-            if output_dir and content:
-                filename = f"{uuid.uuid4()}.md"
-                filepath = os.path.join(output_dir, filename)
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(content)
-            
-            pages.append({
-                "content": content,
-                "url": source_url,
-                "metadata": {
-                    "title": metadata.get('title', ''),
-                    "description": metadata.get('description', ''),
-                    "language": metadata.get('language', 'en'),
-                    "crawl_date": datetime.now().isoformat()
-                }
-            })
-        
-        next_url = response.get('next')
-        if not next_url:
-            break
-            
-        response = firecrawl.get(next_url)
-        time.sleep(1)
-    
+
+    for page in result.get("data", []):
+        content = page.get("markdown", "")
+        metadata = page.get("metadata", {})
+        source_url = metadata.get("sourceURL", url)
+
+        if not content:
+            continue
+
+        pages.append({
+            "content": content,
+            "url": source_url,
+            "metadata": {
+                "title": metadata.get("title", ""),
+                "description": metadata.get("description", ""),
+                "language": metadata.get("language", "en"),
+                "crawl_date": datetime.now().isoformat()
+            }
+        })
+
     return pages
+
 
 def store_embeddings(client: QdrantClient, embedding_model: TextEmbedding, pages: List[Dict], collection_name: str):
     for page in pages:
