@@ -154,11 +154,9 @@ def crawl_documentation(firecrawl_api_key: str, url: str, output_dir: Optional[s
 
     result = firecrawl.crawl(
         url=url,
-        params={
-            "limit": 5,
-            "scrapeOptions": {
-                "formats": ["markdown"]
-            }
+        limit=5,
+        scrape_options={
+            "formats": ["markdown"]
         }
     )
 
@@ -182,6 +180,7 @@ def crawl_documentation(firecrawl_api_key: str, url: str, output_dir: Optional[s
         })
 
     return pages
+
 
 
 def store_embeddings(client: QdrantClient, embedding_model: TextEmbedding, pages: List[Dict], collection_name: str):
